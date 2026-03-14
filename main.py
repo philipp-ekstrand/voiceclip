@@ -1006,16 +1006,15 @@ class WhisperServerProcessManager:
                 "--port",
                 str(self.port),
                 "-l",
-                "de",
+                "auto",
                 "-nt",
                 "-fa",
                 "-t",
-                str(max(2, (os.cpu_count() or 4) // 2)),
+                str(max(4, int(os.cpu_count() or 8))),
                 "-bo",
                 "5",
                 "-bs",
                 "5",
-                "-sns",
             ]
 
             self._process = subprocess.Popen(
@@ -1059,7 +1058,7 @@ class WhisperServerProcessManager:
                 response = session.post(
                     self.inference_url,
                     files={"file": ("warmup.wav", wav_data, "audio/wav")},
-                    data={"response_format": "json", "temperature": "0.0", "temperature_inc": "0.0", "language": "de"},
+                    data={"response_format": "json", "temperature": "0.0", "temperature_inc": "0.0"},
                     timeout=8.0,
                 )
                 response.raise_for_status()
@@ -1279,7 +1278,6 @@ class StreamingTranscriptionController:
                             "response_format": "json",
                             "temperature": "0.0",
                             "temperature_inc": "0.0",
-                            "language": "de",
                         },
                         timeout=10.0,
                     )

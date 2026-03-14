@@ -2371,13 +2371,13 @@ class VoiceClipWidget(QWidget):
     def _transition_check_to_copy(self) -> None:
         if self.state == STATE_CHECK:
             LOGGER.info("check_to_copy_timer_fire session=%s", self.active_session_id or "-")
-            self.enter_copy_state()
+            self._auto_paste()
 
     def _force_copy_if_still_check(self) -> None:
         if self.state != STATE_CHECK:
             return
         LOGGER.warning("check_to_copy_failsafe_fire session=%s", self.active_session_id or "-")
-        self.enter_copy_state()
+        self._auto_paste()
 
     def enter_copy_state(self) -> None:
         self._set_state(STATE_COPY_READY, reason="copy_ready")
@@ -3024,6 +3024,40 @@ class VoiceClipWidget(QWidget):
             )
             return
         self.enter_error_state(f"Transkription fehlgeschlagen: {error_message}", code="TRANSCRIBE_FAILED")
+
+    def _auto_paste(self) -> None:
+        """Copy transcript to clipboard and simulate Cmd+V to paste into active text field."""
+        if not self.last_transcript.strip():
+            self.enter_error_state("Nichts zum Einfuegen vorhanden.", code="COPY_EMPTY")
+            return
+
+        try:
+            copy_text_to_clipboard(self.last_transcript)
+            session_id = self.active_session_id
+            self.last_transcript = ""
+            self._close_session(reason="auto_pasted")
+            self.recorder.force_release()
+            self.enter_idle_state()
+
+            # Simulate Cmd+V after a short delay to ensure clipboard is ready
+            QTimer.singleShot(50, self._simulate_paste)
+
+            LOGGER.info("auto_pasted session=%s", session_id or "-")
+        except Exception as exc:
+            self.enter_error_state(f"Auto-Paste Fehler: {exc}", code="PASTE_ERROR")
+
+    @staticmethod
+    def _simulate_paste() -> None:
+        """Simulate Cmd+V keystroke via AppleScript to paste into the active text field."""
+        try:
+            subprocess.Popen(
+                ["osascript", "-e", 'tell application "System Events" to keystroke "v" using command down'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            LOGGER.info("paste_simulated")
+        except Exception as exc:
+            LOGGER.warning("paste_simulation_failed: %s", exc)
 
     def copy_last_transcript(self) -> None:
         if not self.last_transcript.strip():

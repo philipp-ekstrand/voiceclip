@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+.build/
+*.spec
+
+# macOS app bundle (built artifact, not source)
+voiceClip.app/
+
+# Whisper models (too large for git)
+*.bin
+*.ggml
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Temp files
+/tmp/
+*.part
+
+# PyInstaller artifacts
+<PyQt6*

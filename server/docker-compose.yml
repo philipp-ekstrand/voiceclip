@@ -1,0 +1,24 @@
+services:
+  voiceclip-server:
+    build:
+      context: .
+      args:
+        WHISPER_MODEL: large-v3
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+    environment:
+      - WHISPER_MODEL=large-v3
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=int8
+      - WHISPER_BEAM_SIZE=5
+      - VOICECLIP_API_KEY=${VOICECLIP_API_KEY:-}
+    volumes:
+      - whisper-cache:/root/.cache
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+
+volumes:
+  whisper-cache:

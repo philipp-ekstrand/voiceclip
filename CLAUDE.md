@@ -7,14 +7,14 @@ macOS Menubar-App fuer Sprachtranskription. Click → Record → Click → Stop 
 ## Tech Stack
 
 - **App:** Python 3 + PyQt6, kompiliert mit PyInstaller zu nativer .app
-- **Transkription:** whisper.cpp (`whisper-cli` via Homebrew)
+- **Transkription:** whisper.cpp (`whisper-server` lokal, `whisper-cli` als Fallback)
 - **Modell:** `ggml-large-v3.bin` (2.9GB, volle Praezision)
-- **Audio:** sounddevice (PortAudio) via Subprocess, 16kHz mono PCM
+- **Audio:** sounddevice (PortAudio), In-Process InputStream fuer Streaming, Subprocess fuer HQ-Fallback
 - **Plattform:** macOS only (Apple Silicon, Metal GPU)
 
 ## Architektur
 
-Alles in `main.py` (~3200 Zeilen). Single-File-App.
+Alles in `main.py` (~3300 Zeilen). Single-File-App.
 
 ### Kernklassen
 
@@ -22,22 +22,38 @@ Alles in `main.py` (~3200 Zeilen). Single-File-App.
 |--------|----------|
 | `VoiceClipWidget` | Hauptwidget, State Machine, gesamte UI-Logik |
 | `VoiceClipApp` | Tray-Icon, Menubar-Integration, System-Events |
-| `AudioRecorder` | Subprocess-basierte Audio-Aufnahme (WAV-Datei) |
-| `TranscribeThread` | QThread: ruft `whisper-cli` auf, gibt Text zurueck |
-| `RemoteTranscribeThread` | QThread: sendet WAV an Remote-Server (optional) |
+| `AudioRecorder` | Audio-Aufnahme: In-Process (Streaming) oder Subprocess (HQ) |
+| `StreamingTranscriptionController` | Chunk-Queue, Worker-Thread, Chain-Prompting |
+| `TranscriptAssembler` | Merged Chunk-Transkripte mit Overlap-Deduplizierung |
+| `WhisperServerProcessManager` | Lifecycle: Start, Health, Warmup, Cleanup von whisper-server |
+| `TranscribeThread` | QThread: ruft `whisper-cli` auf (HQ-Fallback) |
 | `FinalizeRecordingThread` | QThread: konvertiert Audio-Chunks zu WAV-Datei |
 
-### User Flow (HQ-Modus, der EINZIGE funktionierende Modus)
+### Modi
+
+**Streaming-Modus ("fast") — Standard:**
+- whisper-server startet beim App-Boot, Modell bleibt im RAM
+- AudioRecorder laeuft In-Process (`sounddevice.InputStream` Callback)
+- 5s Chunks mit 600ms Overlap werden waehrend der Aufnahme transkribiert
+- Chain-Prompting: vorheriger Chunk-Text als Kontext fuer den naechsten
+- Nach Stopp: nur letzter Chunk muss noch verarbeitet werden (~2-3s Wartezeit)
+
+**HQ-Modus — Fallback (wenn whisper-server nicht verfuegbar):**
+- AudioRecorder laeuft als Subprocess, schreibt direkt in WAV-Datei
+- Nach Stopp wird gesamtes Audio per whisper-cli transkribiert
+- Langsamer (~11s fuer 1 Min Audio), aber robuster
+
+### User Flow (Streaming-Modus)
 
 ```
+App Boot → whisper-server startet → Modell in RAM → Warmup
 User klickt Tray → IDLE
-  → start_recording() → STARTING (Mic-Subprocess startet)
-  → RECORDING (Puls-Animation, Audio wird in WAV geschrieben)
+  → start_recording() → STARTING (In-Process InputStream startet)
+  → RECORDING (Puls-Animation, Chunks werden parallel transkribiert)
 
-User klickt nochmal → stop_and_transcribe_hq()
-  → recorder.stop() → Subprocess beendet, WAV-Datei gelesen
-  → STOPPING → FinalizeRecordingThread (Audio → temp WAV)
-  → PROCESSING → TranscribeThread (whisper-cli -m model -f wav)
+User klickt nochmal → stop_and_transcribe()
+  → recorder.stop() → letzter Chunk wird finalisiert
+  → STOPPING → PROCESSING (letzter Chunk transkribiert, ~2-3s)
   → CHECK (Checkmark, 500ms Flash)
   → COPY_READY (Copy-Icon + "Kopieren" Button)
 
@@ -52,28 +68,59 @@ BOOT → DOWNLOADING → IDLE → STARTING → RECORDING → STOPPING → PROCES
                                                                                        ERROR → IDLE
 ```
 
+## Whisper-Server Qualitaetseinstellungen
+
+Der lokale whisper-server startet mit folgenden Flags fuer maximale Transkriptionsqualitaet:
+
+| Flag | Wert | Beschreibung |
+|------|------|-------------|
+| `-l de` | Deutsch | Feste Sprache, kein Auto-Detect pro Chunk |
+| `-bo 5` | best-of 5 | 5 Kandidaten statt Server-Default 2 |
+| `-bs 5` | beam-size 5 | Beam Search statt Greedy Decoding |
+| `-sns` | suppress-nst | Unterdrueckt Non-Speech-Tokens (Artefakte) |
+| `-fa` | flash-attn | Metal GPU-Beschleunigung |
+
+Per-Request Parameter bei jedem Chunk:
+
+| Parameter | Wert | Beschreibung |
+|-----------|------|-------------|
+| `temperature` | 0.0 | Greedy fuer hoechste Konfidenz |
+| `temperature_inc` | 0.2 | Fallback-Retry bei unsicheren Segmenten |
+| `language` | de | Redundanz zum Server-Flag |
+| `prompt` | vorheriger Chunk-Text | Chain-Prompting fuer Kontext-Kontinuitaet |
+
+Streaming-Parameter:
+
+| Parameter | Wert | Beschreibung |
+|-----------|------|-------------|
+| Chunk-Groesse | 5000ms | Genug Kontext fuer Whisper pro Chunk |
+| Overlap | 600ms | Vermeidet Worttrennung an Chunk-Grenzen |
+| Chunk-Timeout | 10s | Ausreichend fuer Beam Search |
+| Chain-Prompt-Laenge | 224 Zeichen | Letzte ~2 Saetze als Kontext |
+
 ## KRITISCHE REGELN
 
 ### Modell
 - **NUR `large-v3` verwenden.** Turbo-Modelle (q5_0 und voll) haben schlechtere Qualitaet.
 - Modell liegt unter `~/.whisper/ggml-large-v3.bin`
 
-### Streaming-Modus ("fast")
-- **IST NICHT FUNKTIONAL.** `AudioRecorder.consume_pending_samples()` ist ein Stub (gibt immer leeres Array zurueck).
-- Der Audio-Worker ist ein Subprocess der direkt in eine WAV-Datei schreibt. Es gibt keinen IPC-Kanal fuer Live-Audio.
-- `self.mode` MUSS auf `"hq"` bleiben bis der Streaming-Code komplett neu implementiert wird.
-- **NIEMALS den Mode auf "fast" setzen ohne eine funktionierende AudioRecorder-Pipeline.**
+### Streaming-Modus
+- Standardmodus ist `"fast"` (Streaming mit whisper-server)
+- AudioRecorder nutzt In-Process `sounddevice.InputStream` (kein Subprocess)
+- `consume_pending_samples()` liefert echte PCM-Daten aus dem Callback-Buffer
+- Falls whisper-server nicht gefunden: automatischer Fallback auf `"hq"` (whisper-cli)
 
 ### Testen
 - **Jede Aenderung an main.py muss getestet werden** bevor sie dem User praesentiert wird.
-- Benchmark-Tests am whisper-server sind NICHT gleichbedeutend mit einem funktionierenden App-Flow.
-- Test-Flow: App starten → Aufnahme → Stopp → Checkmark erscheint → Copy funktioniert.
+- Test-Flow: App starten → Server-Start abwarten → Aufnahme → Stopp → Checkmark erscheint → Copy funktioniert.
 
 ### Performance (gemessene Werte, M3 Pro)
-- whisper-cli (HQ-Modus): 7.7s fuer 33.5s Audio
-- whisper-server (Modell im RAM): 4.6s fuer 33.5s Audio, 2.3s fuer 10s Chunk
-- Hetzner CPU-Server: 28s fuer 33.5s Audio (LANGSAMER als lokal!)
-- Apple Metal GPU ist 3-4x schneller als Hetzner CPX42 CPU fuer Whisper
+
+| Modus | Audio-Laenge | Wartezeit nach Stopp |
+|-------|-------------|---------------------|
+| Streaming (fast) | beliebig | ~2-3s (nur letzter Chunk) |
+| HQ (whisper-cli) | 33.5s | 7.7s |
+| HQ (whisper-cli) | 63s | 11.2s |
 
 ## Env-Variablen
 
@@ -81,6 +128,7 @@ BOOT → DOWNLOADING → IDLE → STARTING → RECORDING → STOPPING → PROCES
 |----------|---------|-------------|
 | `VOICECLIP_HQ_MODEL_PATH` | `~/.whisper/ggml-large-v3.bin` | Pfad zum Modell |
 | `VOICECLIP_WHISPER_CLI` | auto-detect | Pfad zu whisper-cli |
+| `VOICECLIP_CHUNK_MS` | 5000 | Chunk-Groesse in ms (Streaming) |
 | `VOICECLIP_REMOTE_SERVER_URL` | - | Remote-Server URL (optional) |
 | `VOICECLIP_REMOTE_API_KEY` | - | Remote-Server API Key (optional) |
 
@@ -110,13 +158,7 @@ BOOT → DOWNLOADING → IDLE → STARTING → RECORDING → STOPPING → PROCES
 
 ## Bekannte Limitierungen
 
-1. **Geschwindigkeit:** ~7.7s Verarbeitung fuer 33.5s Audio (whisper-cli). Fuer lange Aufnahmen (10 Min) ca. 2 Minuten Wartezeit.
-2. **Luefter:** Waehrend der Transkription dreht die GPU hoch. Dauert aber nur wenige Sekunden.
-3. **Gelegentliche Abstuerze:** Audio-Worker-Subprocess kann in Timeout-Situationen haengen bleiben.
-4. **Streaming nicht implementiert:** Der "fast" Modus existiert als Code, ist aber ein nicht-funktionaler Stub.
-
-## Verbesserungsmoeglichkeiten (Zukunft)
-
-1. **whisper-server statt whisper-cli fuer HQ:** Modell bleibt im RAM, spart Ladezeit pro Transkription. Braucht: TranscribeThread umschreiben auf HTTP POST statt subprocess.
-2. **Echtes Streaming:** AudioRecorder muesste auf IPC-Pipe umgestellt werden statt Subprocess+WAV-File. Groesserer Umbau.
-3. **GPU-Server:** Nur mit NVIDIA GPU sinnvoll (~50-100 EUR/mo). CPU-Server sind langsamer als lokaler M3 Pro.
+1. **Sprache:** Optimiert fuer Deutsch mit englischen Fachbegriffen. Rein englische Memos werden als Deutsch interpretiert (language=de fest).
+2. **Luefter:** Waehrend der Transkription dreht die GPU kurz hoch. Bei Streaming verteilt sich die Last gleichmaessiger.
+3. **Gelegentliche Abstuerze:** Audio-Worker kann in Timeout-Situationen haengen bleiben.
+4. **Erster Start:** whisper-server braucht ~5-10s zum Starten und Warmup. Danach bleibt das Modell im RAM.

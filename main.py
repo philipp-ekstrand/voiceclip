@@ -1293,8 +1293,16 @@ class AudioRecorder:
         self._worker_wav_path: Path | None = None
         self._worker_ready_path: Path | None = None
         self._worker_status_path: Path | None = None
+        # In-process streaming state (used when capture_full_chunks=False)
+        self._inprocess_stream: Any = None
+        self._inprocess_lock = threading.Lock()
+        self._inprocess_pending = bytearray()
+        self._inprocess_full = bytearray()
+        self._inprocess_active = False
 
     def is_active(self) -> bool:
+        if self._inprocess_active:
+            return True
         proc = self._worker_proc
         if proc is None:
             return False
@@ -1385,11 +1393,64 @@ class AudioRecorder:
         resampled = np.interp(target_x, source_x, audio.astype(np.float32))
         return np.clip(np.round(resampled), -32768, 32767).astype(np.int16)
 
+    def _start_inprocess(self) -> None:
+        """Start in-process audio capture for streaming (no subprocess)."""
+        import sounddevice as sd
+
+        self._inprocess_pending = bytearray()
+        self._inprocess_full = bytearray()
+        self._inprocess_active = True
+
+        def callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
+            if not self._inprocess_active:
+                return
+            pcm = indata.tobytes()
+            with self._inprocess_lock:
+                self._inprocess_pending.extend(pcm)
+            self._inprocess_full.extend(pcm)
+
+        self._inprocess_stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="int16",
+            callback=callback,
+            blocksize=self.sample_rate // 10,
+        )
+        self._inprocess_stream.start()
+
+    def _stop_inprocess(self, *, require_full_chunks: bool = True) -> list[np.ndarray]:
+        """Stop in-process audio capture."""
+        self._inprocess_active = False
+        if self._inprocess_stream:
+            try:
+                self._inprocess_stream.stop()
+                self._inprocess_stream.close()
+            except Exception:
+                pass
+            self._inprocess_stream = None
+
+        if not self._capture_full_chunks:
+            return []
+
+        with self._inprocess_lock:
+            audio = np.frombuffer(bytes(self._inprocess_full), dtype=np.int16).copy()
+            self._inprocess_full = bytearray()
+
+        total_samples = int(audio.size)
+        if require_full_chunks and total_samples < int(self.sample_rate * 0.2):
+            raise RuntimeError("Keine Audiodaten erfasst.")
+        return [audio]
+
     def start(self, *, capture_full_chunks: bool = True) -> None:
         if self.is_active():
             raise RuntimeError("Recording laeuft bereits.")
 
         self._capture_full_chunks = capture_full_chunks
+
+        if not capture_full_chunks:
+            self._start_inprocess()
+            return
+
         self._worker_wav_path = self._new_worker_temp_path(".wav")
         self._worker_ready_path = self._new_worker_temp_path(".ready")
         self._worker_status_path = self._new_worker_temp_path(".status")
@@ -1427,9 +1488,17 @@ class AudioRecorder:
         raise RuntimeError(error_message)
 
     def consume_pending_samples(self) -> np.ndarray:
-        return np.empty(0, dtype=np.int16)
+        with self._inprocess_lock:
+            if not self._inprocess_pending:
+                return np.empty(0, dtype=np.int16)
+            data = np.frombuffer(bytes(self._inprocess_pending), dtype=np.int16).copy()
+            self._inprocess_pending.clear()
+            return data
 
     def stop(self, *, require_full_chunks: bool = True) -> list[np.ndarray]:
+        if self._inprocess_active or self._inprocess_stream:
+            return self._stop_inprocess(require_full_chunks=require_full_chunks)
+
         proc = self._worker_proc
         wav_path = self._worker_wav_path
         if proc is None or wav_path is None:
@@ -1462,6 +1531,18 @@ class AudioRecorder:
         return [audio]
 
     def force_release(self) -> None:
+        if self._inprocess_stream:
+            self._inprocess_active = False
+            try:
+                self._inprocess_stream.stop()
+                self._inprocess_stream.close()
+            except Exception:
+                pass
+            self._inprocess_stream = None
+        with self._inprocess_lock:
+            self._inprocess_pending = bytearray()
+        self._inprocess_full = bytearray()
+
         proc = self._worker_proc
         if proc is None:
             return
@@ -1748,9 +1829,9 @@ class VoiceClipWidget(QWidget):
         self.recorder = AudioRecorder()
         self.fast_model_path: str | None = None
         self.hq_model_path: str | None = None
-        # Qualitätsmodus ist absichtlich fixiert:
-        # kein Fast/HQ-Toggle mehr, um versehentliche Qualitätsverluste auszuschließen.
-        self.mode = "hq"
+        # Streaming mode: transcribe chunks during recording for near-instant results.
+        # Falls back to "hq" (whisper-cli) if whisper-server is not available.
+        self.mode = "fast"
         self.settings.setValue("mode.default", self.mode)
 
         self.server_manager: WhisperServerProcessManager | None = None
@@ -2098,8 +2179,10 @@ class VoiceClipWidget(QWidget):
         return "Qualitaet"
 
     def set_mode(self, mode: str) -> None:
-        del mode
-        self.mode = "hq"
+        if mode in ("hq", "fast"):
+            self.mode = mode
+        else:
+            self.mode = "hq"
         self.settings.setValue("mode.default", self.mode)
 
     def enter_boot_state(self) -> None:
@@ -2273,11 +2356,23 @@ class VoiceClipWidget(QWidget):
             existing = find_existing_hq_model_path()
             if existing:
                 self.hq_model_path = str(existing)
+                self.fast_model_path = str(existing)
+
+                if self.mode == "fast" and find_whisper_server():
+                    self._start_fast_backend()
+                    return
+
+                if self.mode == "fast":
+                    LOGGER.warning("whisper-server not found, falling back to hq mode")
+                    self.mode = "hq"
+                    self.settings.setValue("mode.default", self.mode)
+
                 self.enter_idle_state()
                 return
 
             self._download_hq_model(start_after_ready=False)
         except Exception as exc:
+            self.mode = "hq"
             self.enter_idle_state()
             self.notify(APP_NAME, f"Model-Initialisierung fehlgeschlagen: {exc}", QSystemTrayIcon.MessageIcon.Warning)
 

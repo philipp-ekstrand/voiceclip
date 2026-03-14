@@ -71,6 +71,7 @@ ENV_STOPPING_TIMEOUT_SECONDS = "VOICECLIP_STOPPING_TIMEOUT_SECONDS"
 ENV_RECORD_START_TIMEOUT_SECONDS = "VOICECLIP_RECORD_START_TIMEOUT_SECONDS"
 ENV_REMOTE_SERVER_URL = "VOICECLIP_REMOTE_SERVER_URL"
 ENV_REMOTE_API_KEY = "VOICECLIP_REMOTE_API_KEY"
+ENV_GROQ_API_KEY = "GROQ_API_KEY"
 
 INSTANCE_SERVER_NAME = "com.voiceclip.voiceclip.instance"
 
@@ -86,8 +87,8 @@ ACCENT_ORANGE_DARK = "#e14b17"
 ACCENT_ORANGE_SOFT = "#ffd9cc"
 CHECK_FLASH_MS = 500
 
-STREAM_CHUNK_MS_DEFAULT = 5000
-STREAM_OVERLAP_MS_DEFAULT = 600
+STREAM_CHUNK_MS_DEFAULT = 10000
+STREAM_OVERLAP_MS_DEFAULT = 1000
 STREAM_MIN_TAIL_MS = 220
 STREAM_FLUSH_TIMEOUT_SECONDS = 45.0
 MAX_QUEUE_CHUNKS_DEFAULT = 120
@@ -136,6 +137,39 @@ def _build_logger() -> logging.Logger:
 
 
 LOGGER = _build_logger()
+
+
+def _load_env_local() -> None:
+    candidates = [
+        Path(__file__).resolve().parent / ".env.local",
+        Path(sys.executable).resolve().parent / ".env.local",
+        APP_SUPPORT_DIR / ".env.local",
+    ]
+    env_file = None
+    for candidate in candidates:
+        if candidate.is_file():
+            env_file = candidate
+            break
+    if env_file is None:
+        return
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if key:
+                os.environ.setdefault(key, value)
+                LOGGER.info("env_local_loaded key=%s", key)
+    except Exception as exc:
+        LOGGER.warning("env_local_load_failed error=%s", exc)
+
+
+_load_env_local()
 
 
 def _worker_option_value(args: list[str], name: str) -> str | None:
@@ -1006,7 +1040,7 @@ class WhisperServerProcessManager:
                 "--port",
                 str(self.port),
                 "-l",
-                "auto",
+                "de",
                 "-nt",
                 "-fa",
                 "-t",
@@ -1812,6 +1846,57 @@ class RemoteTranscribeThread(QThread):
             self.failed.emit(self.session_id, f"Server-Fehler: {exc}")
 
 
+def _groq_api_key() -> str:
+    return os.environ.get(ENV_GROQ_API_KEY, "").strip()
+
+
+class GroqTranscribeThread(QThread):
+    finished_ok = pyqtSignal(str, str)
+    failed = pyqtSignal(str, str)
+
+    GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+    def __init__(self, session_id: str, wav_path: Path, api_key: str) -> None:
+        super().__init__()
+        self.session_id = session_id
+        self.wav_path = wav_path
+        self.api_key = api_key
+
+    def run(self) -> None:
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        try:
+            with open(self.wav_path, "rb") as f:
+                response = requests.post(
+                    self.GROQ_URL,
+                    files={"file": ("recording.wav", f, "audio/wav")},
+                    data={"model": "whisper-large-v3", "language": "de"},
+                    headers=headers,
+                    timeout=60.0,
+                )
+            response.raise_for_status()
+            data = response.json()
+            transcript = data.get("text", "").strip()
+            LOGGER.info("groq_transcribe ok chars=%s", len(transcript))
+            if not transcript:
+                self.failed.emit(self.session_id, "Groq API hat leere Transkription zurueckgegeben.")
+                return
+            self.finished_ok.emit(self.session_id, transcript)
+        except requests.exceptions.ConnectionError:
+            self.failed.emit(self.session_id, "Groq API nicht erreichbar. Pruefe Internetverbindung.")
+        except requests.exceptions.Timeout:
+            self.failed.emit(self.session_id, "Groq API Timeout.")
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "?"
+            body = ""
+            try:
+                body = exc.response.json().get("error", {}).get("message", "") if exc.response is not None else ""
+            except Exception:
+                pass
+            self.failed.emit(self.session_id, f"Groq API Fehler ({status}): {body or exc}")
+        except Exception as exc:
+            self.failed.emit(self.session_id, f"Groq Fehler: {exc}")
+
+
 class VoiceClipWidget(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -1837,9 +1922,13 @@ class VoiceClipWidget(QWidget):
         self.recorder = AudioRecorder()
         self.fast_model_path: str | None = None
         self.hq_model_path: str | None = None
-        # Streaming mode: transcribe chunks during recording for near-instant results.
-        # Falls back to "hq" (whisper-cli) if whisper-server is not available.
-        self.mode = "fast"
+        # Groq API key (if set, Groq is primary transcription backend)
+        self._groq_api_key = _groq_api_key()
+        if self._groq_api_key:
+            LOGGER.info("groq_api_configured")
+            self.mode = "hq"
+        else:
+            self.mode = "hq"
         self.settings.setValue("mode.default", self.mode)
 
         self.server_manager: WhisperServerProcessManager | None = None
@@ -2184,6 +2273,8 @@ class VoiceClipWidget(QWidget):
         return uuid.uuid4().hex
 
     def mode_label(self) -> str:
+        if self._groq_api_key:
+            return "Groq Cloud"
         return "Qualitaet"
 
     def set_mode(self, mode: str) -> None:
@@ -2832,7 +2923,19 @@ class VoiceClipWidget(QWidget):
             return
         self.current_wav_path = Path(wav_path)
 
-        # Try remote server first, fall back to local whisper-cli
+        # Priority 1: Groq API (fastest, same quality)
+        if self._groq_api_key:
+            self.enter_processing_state()
+            LOGGER.info("transcribe_groq session=%s", session_id)
+            self.transcribe_thread = GroqTranscribeThread(
+                session_id, self.current_wav_path, self._groq_api_key
+            )
+            self.transcribe_thread.finished_ok.connect(self._on_transcript_ready)
+            self.transcribe_thread.failed.connect(self._on_groq_failed_fallback)
+            self.transcribe_thread.start()
+            return
+
+        # Priority 2: Custom remote server
         if self._remote_server_url and self._remote_server_healthy:
             self.enter_processing_state()
             LOGGER.info("transcribe_remote url=%s session=%s", self._remote_server_url, session_id)
@@ -2844,12 +2947,28 @@ class VoiceClipWidget(QWidget):
             self.transcribe_thread.start()
             return
 
+        # Priority 3: Local whisper-cli
         if not self.hq_model_path:
             self._close_session(reason="hq_missing_model")
             self.enter_error_state("HQ-Modell nicht gefunden.", code="HQ_MODEL_MISSING")
             return
 
         self.enter_processing_state()
+        self.transcribe_thread = TranscribeThread(session_id, self.hq_model_path, self.current_wav_path)
+        self.transcribe_thread.finished_ok.connect(self._on_transcript_ready)
+        self.transcribe_thread.failed.connect(self._on_transcript_failed)
+        self.transcribe_thread.start()
+
+    def _on_groq_failed_fallback(self, session_id: str, error_message: str) -> None:
+        """Groq API failed -- fall back to local whisper-cli."""
+        LOGGER.warning("groq_transcribe_failed error=%s fallback=local session=%s", error_message, session_id)
+        if not self._is_session_active(session_id):
+            return
+        if not self.hq_model_path or not self.current_wav_path:
+            self._on_transcript_failed(session_id, f"Groq-Fehler und kein lokales Modell: {error_message}")
+            return
+
+        self.notify(APP_NAME, "Groq nicht erreichbar, nutze lokales Modell ...", QSystemTrayIcon.MessageIcon.Warning)
         self.transcribe_thread = TranscribeThread(session_id, self.hq_model_path, self.current_wav_path)
         self.transcribe_thread.finished_ok.connect(self._on_transcript_ready)
         self.transcribe_thread.failed.connect(self._on_transcript_failed)

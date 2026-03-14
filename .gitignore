@@ -34,6 +34,10 @@ voiceClip.app/
 *.swp
 *.swo
 
+# Environment (API keys)
+.env
+.env.local
+
 # Logs
 *.log
 

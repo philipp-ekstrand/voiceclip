@@ -1059,7 +1059,7 @@ class WhisperServerProcessManager:
                 response = session.post(
                     self.inference_url,
                     files={"file": ("warmup.wav", wav_data, "audio/wav")},
-                    data={"response_format": "json", "temperature": "0.0", "temperature_inc": "0.2", "language": "de"},
+                    data={"response_format": "json", "temperature": "0.0", "temperature_inc": "0.0", "language": "de"},
                     timeout=8.0,
                 )
                 response.raise_for_status()
@@ -1257,15 +1257,8 @@ class StreamingTranscriptionController:
         self._queue.put((chunk_index, pcm_chunk))
         return True
 
-    _BASE_PROMPT = (
-        "Also, ich habe jetzt den Code reviewed und das Deployment gemacht. "
-        "Der API-Endpoint funktioniert, aber die Performance beim Streaming ist noch nicht optimal. "
-        "Ich muss noch den Frontend-Teil refactoren und die Pipeline anpassen."
-    )
-
     def _worker_loop(self) -> None:
         session = requests.Session()
-        prev_text = ""
         try:
             while not self._abort_event.is_set():
                 try:
@@ -1278,13 +1271,6 @@ class StreamingTranscriptionController:
 
                 chunk_index, pcm_data = item
                 try:
-                    # Chain prompting: use previous chunk transcript as context,
-                    # falling back to base prompt for the first chunk.
-                    if prev_text:
-                        prompt = prev_text[-224:]
-                    else:
-                        prompt = self._BASE_PROMPT
-
                     wav_data = pcm16_to_wav_bytes(pcm_data, self.sample_rate)
                     response = session.post(
                         self.inference_url,
@@ -1292,17 +1278,14 @@ class StreamingTranscriptionController:
                         data={
                             "response_format": "json",
                             "temperature": "0.0",
-                            "temperature_inc": "0.2",
+                            "temperature_inc": "0.0",
                             "language": "de",
-                            "prompt": prompt,
                         },
                         timeout=10.0,
                     )
                     response.raise_for_status()
                     text = extract_whisper_server_text(response)
                     self._assembler.add(chunk_index, text)
-                    if text.strip():
-                        prev_text = text.strip()
                 except Exception as exc:
                     if self._worker_error is None:
                         self._worker_error = f"Chunk-Transkription fehlgeschlagen: {exc}"

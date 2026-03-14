@@ -1,100 +1,110 @@
-# voiceClip (macOS, offline)
+# voiceClip (macOS)
 
-Local speech-to-text transcription in your macOS menubar. Click to record, click to stop, click to copy. Powered by whisper.cpp with the `large-v3` model — 100% offline, no API costs.
+Sprach-Transkription in der macOS Menubar. Klick → Aufnahme → Klick → Stop → Klick → Kopieren → Cmd+V. Nutzt Groq's Whisper API fuer instant-Transkription (<1 Sekunde). Offline-Fallback auf lokales whisper-cli.
 
-## Features
+## Setup (fuer Claude Code Agents)
 
-- **Menubar workflow:** Record → Stop → Copy → Cmd+V
-- **Streaming transcription:** Audio is transcribed during recording, not after. ~2-3s wait regardless of recording length.
-- **Fully offline:** All processing on-device (Apple Silicon, Metal GPU)
-- **High quality:** Whisper large-v3 with beam search, chain prompting, tuned for German/English mixed speech
-- **Single-instance:** Only one voiceClip runs at a time
+> **WICHTIG:** Diese Anleitung ist so geschrieben, dass ein Claude Code Agent sie Schritt fuer Schritt ausfuehren kann. Alle Befehle muessen auf macOS mit Apple Silicon laufen.
 
-## Quick Start
+### Schritt 1: Repository klonen
 
 ```bash
-# 1. Setup (one-time)
+git clone https://github.com/philipp-ekstrand/voiceclip.git
+cd voiceclip
+```
+
+### Schritt 2: Dependencies installieren
+
+```bash
 ./setup.sh
-
-# 2. Run from source
-./run.sh
 ```
 
-On first launch, the whisper model (~2.9 GB) is downloaded automatically.
+Das installiert: Homebrew-Pakete (`portaudio`, `whisper-cpp`), Python venv, pip-Pakete.
 
-## Build .app
+### Schritt 3: Groq API Key einrichten
+
+Erstelle die Datei `~/.config/voiceClip/.env.local` (oder `~/Library/Application Support/voiceClip/.env.local`):
 
 ```bash
-# Build native macOS app
-./scripts/build_app.sh
-
-# Sign locally (development)
-./scripts/sign_local.sh
-
-# Sign + notarize (distribution)
-./scripts/sign_notarize.sh /Applications/voiceClip.app \
-  "Developer ID Application: YOUR NAME (TEAMID)" \
-  my-notary-profile
+mkdir -p ~/Library/Application\ Support/voiceClip
+cat > ~/Library/Application\ Support/voiceClip/.env.local << 'EOF'
+GROQ_API_KEY=dein-api-key-hier
+EOF
 ```
 
-See [architecture/BUILD_RELEASE.md](architecture/BUILD_RELEASE.md) for details.
+API Key bekommst du unter https://console.groq.com → API Keys → Create API Key.
+
+### Schritt 4: App bauen und installieren
+
+```bash
+./scripts/build_app.sh
+./scripts/sign_local.sh
+```
+
+Die App liegt danach unter `/Applications/voiceClip.app`.
+
+### Schritt 5: Starten
+
+Doppelklick auf `/Applications/voiceClip.app` oder:
+
+```bash
+open /Applications/voiceClip.app
+```
+
+Das Mikrofon-Icon erscheint in der Menubar (oben rechts).
+
+### Schritt 6 (optional): Autostart
+
+```bash
+osascript -e 'tell application "System Events" to make login item at end with properties {path:"/Applications/voiceClip.app", hidden:false}'
+```
 
 ## User Flow
 
-1. Click menubar icon → recording starts
-2. Click again → recording stops, transcription finalizes (~2-3s)
-3. Click copy icon → text copied to clipboard
-4. Cmd+V → paste anywhere
+1. Menubar-Icon klicken → Aufnahme startet
+2. Nochmal klicken → Aufnahme stoppt, Transkription (<1s)
+3. Copy-Icon klicken → Text im Clipboard
+4. Cmd+V → Einfuegen
 
-The menubar menu also provides:
-- **Session zuruecksetzen** — reset if something gets stuck
-- **Engine neu starten** — restart whisper-server
+## Transcription Backends (Prioritaet)
 
-## How It Works
+| Prioritaet | Backend | Wann | Speed | Kosten |
+|-----------|---------|------|-------|--------|
+| 1 | **Groq API** | `GROQ_API_KEY` gesetzt | <1s | ~$5-7/Monat |
+| 2 | Lokales whisper-cli | Kein API Key oder offline | ~8-11s/Min | Kostenlos |
 
-VoiceClip uses **streaming transcription**: audio is split into 5-second chunks and sent to a local whisper-server during recording. By the time you stop, most audio is already transcribed. Only the final chunk needs processing.
-
-If whisper-server is unavailable, VoiceClip falls back to whisper-cli (slower, processes all audio after stop).
-
-## Architecture Documentation
-
-| Document | Description |
-|----------|-------------|
-| [architecture/README.md](architecture/README.md) | Overview, class map, tech stack |
-| [architecture/STATE_MACHINE.md](architecture/STATE_MACHINE.md) | UI states, transitions, error recovery |
-| [architecture/AUDIO_PIPELINE.md](architecture/AUDIO_PIPELINE.md) | Audio capture, streaming vs HQ mode |
-| [architecture/STREAMING.md](architecture/STREAMING.md) | Streaming deep dive, quality tuning |
-| [architecture/BUILD_RELEASE.md](architecture/BUILD_RELEASE.md) | Build, sign, notarize, deploy |
-| [architecture/CONFIGURATION.md](architecture/CONFIGURATION.md) | Env vars, settings, runtime files |
-
-## Model
-
-- **File:** `~/.whisper/ggml-large-v3.bin` (2.9 GB)
-- **Quality:** Full precision (no quantization)
-- **Auto-download:** On first launch if missing
+Bei Netzwerkausfall faellt die App automatisch auf lokales whisper-cli zurueck (Notification wird angezeigt).
 
 ## Requirements
 
 - macOS (Apple Silicon)
 - Python 3
 - Homebrew
-- `whisper-cpp` (`brew install whisper-cpp`)
-- `portaudio` (`brew install portaudio`)
+- Internetverbindung (fuer Groq API; ohne gehts lokal weiter)
 
-## Configuration
+## Dateien
 
-All settings are optional. See [architecture/CONFIGURATION.md](architecture/CONFIGURATION.md) for the full reference.
+| Datei | Beschreibung |
+|-------|-------------|
+| `main.py` | Gesamte App (~3400 Zeilen, Single-File) |
+| `.env.local` | Groq API Key (NICHT committen!) |
+| `voiceClip.spec` | PyInstaller Build-Config |
+| `setup.sh` | Dependency-Installation |
+| `run.sh` | Dev-Modus (aus Source) |
+| `scripts/build_app.sh` | Baut `/Applications/voiceClip.app` |
+| `scripts/sign_local.sh` | Lokales Code-Signing |
+| `scripts/sign_notarize.sh` | Apple Notarisierung (Distribution) |
 
-Key environment variables:
+## Logs & Diagnose
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VOICECLIP_CHUNK_MS` | `5000` | Streaming chunk size (ms) |
-| `VOICECLIP_OVERLAP_MS` | `600` | Chunk overlap (ms) |
-| `VOICECLIP_SERVER_PORT` | dynamic | Fixed port for whisper-server |
+```bash
+# Aktuelle Logs
+tail -50 ~/Library/Logs/voiceClip/voiceclip.log
 
-## Runtime Files
+# Pruefen ob Groq aktiv
+grep "groq_api_configured" ~/Library/Logs/voiceClip/voiceclip.log
+```
 
-- **Logs:** `~/Library/Logs/voiceClip/voiceclip.log`
-- **Server registry:** `~/Library/Application Support/voiceClip/whisper_servers.json`
-- **Models:** `~/.whisper/`
+## Architecture Documentation
+
+Detaillierte technische Docs unter [architecture/](architecture/README.md).

@@ -2,95 +2,103 @@
 
 ## Was ist VoiceClip?
 
-macOS Menubar-App fuer Sprachtranskription. Aufnahme starten -> Stoppen -> Text im Clipboard. Primaer: Remote-Server mit `faster-whisper` (large-v3). Fallback: lokales whisper.cpp.
+macOS Menubar-App fuer Sprachtranskription. Click → Record → Click → Stop → Checkmark → Copy → Cmd+V. Basiert auf whisper.cpp mit dem `large-v3` Modell (lokal, offline).
 
 ## Tech Stack
 
-- **Client:** Python 3 + PyQt6, kompiliert mit PyInstaller zu nativer .app
-- **Server:** FastAPI + faster-whisper (CTranslate2), Docker auf Hetzner VPS
-- **Lokaler Fallback:** whisper.cpp (`whisper-cli` via Homebrew)
-- **Modell:** `large-v3` (volle Praezision, sowohl lokal als auch remote)
-- **Audio:** sounddevice (PortAudio), 16kHz mono PCM
-- **Plattform:** macOS only (Apple Silicon optimiert, Metal GPU)
+- **App:** Python 3 + PyQt6, kompiliert mit PyInstaller zu nativer .app
+- **Transkription:** whisper.cpp (`whisper-cli` via Homebrew)
+- **Modell:** `ggml-large-v3.bin` (2.9GB, volle Praezision)
+- **Audio:** sounddevice (PortAudio) via Subprocess, 16kHz mono PCM
+- **Plattform:** macOS only (Apple Silicon, Metal GPU)
 
 ## Architektur
 
-### Client (main.py, ~3200 Zeilen)
+Alles in `main.py` (~3200 Zeilen). Single-File-App.
+
+### Kernklassen
 
 | Klasse | Funktion |
 |--------|----------|
-| `VoiceClipWidget` | Hauptwidget, State Machine, UI |
-| `RemoteTranscribeThread` | Remote-Transkription via HTTPS POST an Server |
-| `TranscribeThread` | Lokale Transkription via whisper-cli (Fallback) |
-| `StreamingTranscriptionController` | Streaming-Chunks (fuer Phase 3) |
-| `WhisperServerProcessManager` | Lokaler whisper-server Lifecycle |
-| `AudioRecorder` | Audio-Aufnahme via Subprocess |
-| `TranscriptAssembler` | Overlap-Deduplikation fuer Streaming |
+| `VoiceClipWidget` | Hauptwidget, State Machine, gesamte UI-Logik |
+| `VoiceClipApp` | Tray-Icon, Menubar-Integration, System-Events |
+| `AudioRecorder` | Subprocess-basierte Audio-Aufnahme (WAV-Datei) |
+| `TranscribeThread` | QThread: ruft `whisper-cli` auf, gibt Text zurueck |
+| `RemoteTranscribeThread` | QThread: sendet WAV an Remote-Server (optional) |
+| `FinalizeRecordingThread` | QThread: konvertiert Audio-Chunks zu WAV-Datei |
 
-### Server (server/)
+### User Flow (HQ-Modus, der EINZIGE funktionierende Modus)
 
-| Datei | Funktion |
-|-------|----------|
-| `app.py` | FastAPI mit /health, /transcribe, /transcribe-chunk |
-| `Dockerfile` | Python 3.11 + faster-whisper, Modell wird beim Build geladen |
-| `docker-compose.yml` | Deployment-Konfiguration |
+```
+User klickt Tray → IDLE
+  → start_recording() → STARTING (Mic-Subprocess startet)
+  → RECORDING (Puls-Animation, Audio wird in WAV geschrieben)
 
-### Transkriptions-Flow
+User klickt nochmal → stop_and_transcribe_hq()
+  → recorder.stop() → Subprocess beendet, WAV-Datei gelesen
+  → STOPPING → FinalizeRecordingThread (Audio → temp WAV)
+  → PROCESSING → TranscribeThread (whisper-cli -m model -f wav)
+  → CHECK (Checkmark, 500ms Flash)
+  → COPY_READY (Copy-Icon + "Kopieren" Button)
 
-1. User klickt Menubar-Icon -> Aufnahme startet
-2. User klickt nochmal -> Aufnahme stoppt, WAV wird erstellt
-3. **Server verfuegbar?** WAV wird per HTTPS an `/transcribe` gesendet
-4. **Server nicht verfuegbar?** Fallback auf lokales `whisper-cli`
-5. Transkript -> Clipboard -> User kann mit Cmd+V einfuegen
+User klickt Copy → Text in Clipboard → IDLE
+```
+
+### State Machine
+
+```
+BOOT → DOWNLOADING → IDLE → STARTING → RECORDING → STOPPING → PROCESSING → CHECK → COPY_READY → IDLE
+                                                                                         ↓
+                                                                                       ERROR → IDLE
+```
+
+## KRITISCHE REGELN
+
+### Modell
+- **NUR `large-v3` verwenden.** Turbo-Modelle (q5_0 und voll) haben schlechtere Qualitaet.
+- Modell liegt unter `~/.whisper/ggml-large-v3.bin`
+
+### Streaming-Modus ("fast")
+- **IST NICHT FUNKTIONAL.** `AudioRecorder.consume_pending_samples()` ist ein Stub (gibt immer leeres Array zurueck).
+- Der Audio-Worker ist ein Subprocess der direkt in eine WAV-Datei schreibt. Es gibt keinen IPC-Kanal fuer Live-Audio.
+- `self.mode` MUSS auf `"hq"` bleiben bis der Streaming-Code komplett neu implementiert wird.
+- **NIEMALS den Mode auf "fast" setzen ohne eine funktionierende AudioRecorder-Pipeline.**
+
+### Testen
+- **Jede Aenderung an main.py muss getestet werden** bevor sie dem User praesentiert wird.
+- Benchmark-Tests am whisper-server sind NICHT gleichbedeutend mit einem funktionierenden App-Flow.
+- Test-Flow: App starten → Aufnahme → Stopp → Checkmark erscheint → Copy funktioniert.
+
+### Performance (gemessene Werte, M3 Pro)
+- whisper-cli (HQ-Modus): 7.7s fuer 33.5s Audio
+- whisper-server (Modell im RAM): 4.6s fuer 33.5s Audio, 2.3s fuer 10s Chunk
+- Hetzner CPU-Server: 28s fuer 33.5s Audio (LANGSAMER als lokal!)
+- Apple Metal GPU ist 3-4x schneller als Hetzner CPX42 CPU fuer Whisper
 
 ## Env-Variablen
 
 | Variable | Default | Beschreibung |
 |----------|---------|-------------|
-| `VOICECLIP_REMOTE_SERVER_URL` | - | URL des Transkriptions-Servers (z.B. `https://whisper.example.com`) |
-| `VOICECLIP_REMOTE_API_KEY` | - | Bearer-Token fuer Server-Auth |
-| `VOICECLIP_HQ_MODEL_PATH` | `~/.whisper/ggml-large-v3.bin` | Pfad zum lokalen Modell |
+| `VOICECLIP_HQ_MODEL_PATH` | `~/.whisper/ggml-large-v3.bin` | Pfad zum Modell |
 | `VOICECLIP_WHISPER_CLI` | auto-detect | Pfad zu whisper-cli |
-| `VOICECLIP_WHISPER_SERVER` | auto-detect | Pfad zu whisper-server |
-| `VOICECLIP_CHUNK_MS` | 2200 | Streaming Chunk-Groesse |
-| `VOICECLIP_OVERLAP_MS` | 350 | Streaming Overlap |
+| `VOICECLIP_REMOTE_SERVER_URL` | - | Remote-Server URL (optional) |
+| `VOICECLIP_REMOTE_API_KEY` | - | Remote-Server API Key (optional) |
 
 ## Build & Run
 
 ```bash
-# Client: Setup (einmalig)
+# Setup (einmalig)
 ./setup.sh
 
-# Client: Dev-Modus
+# Dev-Modus (aus Source)
 ./run.sh
 
-# Client: App bauen
+# App bauen (.app Bundle)
 ./scripts/build_app.sh
 
-# Server: Lokal testen
-cd server && docker compose up --build
-
-# Server: Mit API-Key
-VOICECLIP_API_KEY=mein-secret docker compose up --build
+# Lokal signieren
+./scripts/sign_local.sh
 ```
-
-## Server-Deployment
-
-```bash
-# Auf dem Hetzner VPS
-git clone <repo> && cd voiceclip/server
-echo "VOICECLIP_API_KEY=<secret>" > .env
-docker compose up -d --build
-```
-
-## Wichtige Regeln
-
-- **Qualitaet geht vor Speed.** Immer `large-v3` Modell verwenden.
-- **Keine API-Kosten.** Alles auf eigenem Server oder lokal.
-- **Das quantisierte Turbo-Modell (q5_0) hat schlechte Qualitaet** -> Nicht verwenden!
-- **Das volle Turbo-Modell hat ebenfalls messbar schlechtere Qualitaet** -> Nicht verwenden!
-- **Server-first:** Wenn `VOICECLIP_REMOTE_SERVER_URL` gesetzt ist, wird der Server bevorzugt.
-- **Automatischer Fallback:** Wenn Server nicht erreichbar, wird lokal transkribiert.
 
 ## Runtime-Dateien
 
@@ -98,3 +106,17 @@ docker compose up -d --build
 - Server-Registry: `~/Library/Application Support/voiceClip/whisper_servers.json`
 - PID: `~/Library/Application Support/voiceClip/voiceclip.pid`
 - Modelle: `~/.whisper/`
+- Settings: macOS QSettings (`com.voiceclip.voiceClip`)
+
+## Bekannte Limitierungen
+
+1. **Geschwindigkeit:** ~7.7s Verarbeitung fuer 33.5s Audio (whisper-cli). Fuer lange Aufnahmen (10 Min) ca. 2 Minuten Wartezeit.
+2. **Luefter:** Waehrend der Transkription dreht die GPU hoch. Dauert aber nur wenige Sekunden.
+3. **Gelegentliche Abstuerze:** Audio-Worker-Subprocess kann in Timeout-Situationen haengen bleiben.
+4. **Streaming nicht implementiert:** Der "fast" Modus existiert als Code, ist aber ein nicht-funktionaler Stub.
+
+## Verbesserungsmoeglichkeiten (Zukunft)
+
+1. **whisper-server statt whisper-cli fuer HQ:** Modell bleibt im RAM, spart Ladezeit pro Transkription. Braucht: TranscribeThread umschreiben auf HTTP POST statt subprocess.
+2. **Echtes Streaming:** AudioRecorder muesste auf IPC-Pipe umgestellt werden statt Subprocess+WAV-File. Groesserer Umbau.
+3. **GPU-Server:** Nur mit NVIDIA GPU sinnvoll (~50-100 EUR/mo). CPU-Server sind langsamer als lokaler M3 Pro.

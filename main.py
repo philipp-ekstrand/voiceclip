@@ -86,8 +86,8 @@ ACCENT_ORANGE_DARK = "#e14b17"
 ACCENT_ORANGE_SOFT = "#ffd9cc"
 CHECK_FLASH_MS = 500
 
-STREAM_CHUNK_MS_DEFAULT = 10000
-STREAM_OVERLAP_MS_DEFAULT = 1000
+STREAM_CHUNK_MS_DEFAULT = 2200
+STREAM_OVERLAP_MS_DEFAULT = 350
 STREAM_MIN_TAIL_MS = 220
 STREAM_FLUSH_TIMEOUT_SECONDS = 45.0
 MAX_QUEUE_CHUNKS_DEFAULT = 120
@@ -1748,9 +1748,9 @@ class VoiceClipWidget(QWidget):
         self.recorder = AudioRecorder()
         self.fast_model_path: str | None = None
         self.hq_model_path: str | None = None
-        # Streaming-Modus: Audio-Chunks werden waehrend der Aufnahme an den
-        # lokalen whisper-server gesendet. Nutzt dasselbe large-v3 Modell.
-        self.mode = "fast"
+        # Qualitätsmodus ist absichtlich fixiert:
+        # kein Fast/HQ-Toggle mehr, um versehentliche Qualitätsverluste auszuschließen.
+        self.mode = "hq"
         self.settings.setValue("mode.default", self.mode)
 
         self.server_manager: WhisperServerProcessManager | None = None
@@ -2098,7 +2098,8 @@ class VoiceClipWidget(QWidget):
         return "Qualitaet"
 
     def set_mode(self, mode: str) -> None:
-        self.mode = mode if mode in ("hq", "fast") else "fast"
+        del mode
+        self.mode = "hq"
         self.settings.setValue("mode.default", self.mode)
 
     def enter_boot_state(self) -> None:
@@ -2272,11 +2273,6 @@ class VoiceClipWidget(QWidget):
             existing = find_existing_hq_model_path()
             if existing:
                 self.hq_model_path = str(existing)
-                # In fast mode, also use the HQ model for the whisper-server
-                if self.mode == "fast":
-                    self.fast_model_path = str(existing)
-                    self._start_fast_backend()
-                    return
                 self.enter_idle_state()
                 return
 

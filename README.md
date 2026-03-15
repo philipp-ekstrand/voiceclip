@@ -1,6 +1,6 @@
 # voiceClip (macOS)
 
-Sprach-Transkription in der macOS Menubar. Klick → Aufnahme → Klick → Stop → Klick → Kopieren → Cmd+V. Nutzt Groq's Whisper API fuer instant-Transkription (<1 Sekunde). Offline-Fallback auf lokales whisper-cli.
+Sprach-Transkription in der macOS Menubar. Klick → Aufnahme → Klick → Stop → Text wird automatisch ins aktive Textfeld eingefuegt. Nutzt Groq's Whisper API fuer instant-Transkription (<1 Sekunde). Offline-Fallback auf lokales whisper-cli.
 
 ## Setup (fuer Claude Code Agents)
 
@@ -61,10 +61,10 @@ osascript -e 'tell application "System Events" to make login item at end with pr
 
 ## User Flow
 
-1. Menubar-Icon klicken → Aufnahme startet
-2. Nochmal klicken → Aufnahme stoppt, Transkription (<1s)
-3. Copy-Icon klicken → Text im Clipboard
-4. Cmd+V → Einfuegen
+1. In ein beliebiges Textfeld klicken (Slack, Mail, Browser, etc.)
+2. Menubar-Icon klicken → Aufnahme startet
+3. Nochmal klicken → Aufnahme stoppt, Transkription (<1s)
+4. Text wird automatisch ins aktive Textfeld eingefuegt (Auto-Paste)
 
 ## Transcription Backends (Prioritaet)
 

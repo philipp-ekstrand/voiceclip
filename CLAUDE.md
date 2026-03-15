@@ -2,7 +2,7 @@
 
 ## Was ist VoiceClip?
 
-macOS Menubar-App fuer Sprachtranskription. Click → Record → Click → Stop → Checkmark → Copy → Cmd+V. Basiert auf whisper.cpp mit dem `large-v3` Modell (lokal, offline).
+macOS Menubar-App fuer Sprachtranskription. Click → Record → Click → Stop → Text wird automatisch ins aktive Textfeld eingefuegt (Auto-Paste). Primaer Groq Whisper API, Fallback auf lokales whisper-cli.
 
 ## Tech Stack
 
@@ -46,26 +46,26 @@ Alles in `main.py` (~3300 Zeilen). Single-File-App.
 ### User Flow (Streaming-Modus)
 
 ```
-App Boot → whisper-server startet → Modell in RAM → Warmup
+App Boot → Groq API Key geladen (oder Fallback auf whisper-cli)
+User klickt in Textfeld (Slack, Mail, Browser, etc.)
 User klickt Tray → IDLE
   → start_recording() → STARTING (In-Process InputStream startet)
-  → RECORDING (Puls-Animation, Chunks werden parallel transkribiert)
+  → RECORDING (Puls-Animation)
 
 User klickt nochmal → stop_and_transcribe()
-  → recorder.stop() → letzter Chunk wird finalisiert
-  → STOPPING → PROCESSING (letzter Chunk transkribiert, ~2-3s)
+  → recorder.stop() → Audio wird an Groq API gesendet
+  → STOPPING → PROCESSING (Transkription, <1s mit Groq)
   → CHECK (Checkmark, 500ms Flash)
-  → COPY_READY (Copy-Icon + "Kopieren" Button)
-
-User klickt Copy → Text in Clipboard → IDLE
+  → Auto-Paste: Text wird in Clipboard kopiert + Cmd+V simuliert → direkt ins aktive Textfeld eingefuegt
+  → Session geschlossen → IDLE
 ```
 
 ### State Machine
 
 ```
-BOOT → DOWNLOADING → IDLE → STARTING → RECORDING → STOPPING → PROCESSING → CHECK → COPY_READY → IDLE
-                                                                                         ↓
-                                                                                       ERROR → IDLE
+BOOT → IDLE → STARTING → RECORDING → STOPPING → PROCESSING → CHECK → (Auto-Paste) → IDLE
+                                                                            ↓
+                                                                          ERROR → IDLE
 ```
 
 ## Whisper-Server Qualitaetseinstellungen

@@ -946,6 +946,50 @@ def pcm16_to_wav_bytes(pcm_data: bytes, sample_rate: int) -> bytes:
         return buffer.getvalue()
 
 
+# ── Opus compression for Groq API uploads (reduces upload size ~10x) ─────────
+
+_FFMPEG_PATH: str | None = shutil.which("ffmpeg")
+
+
+def wav_to_ogg_opus(wav_path: Path) -> tuple[Path, bool]:
+    """Convert WAV to OGG Opus for faster uploads. Returns (path, is_opus).
+
+    Falls back to original WAV if ffmpeg is unavailable or conversion fails.
+    Quality is lossless-equivalent for speech at 64k bitrate (Opus is designed
+    for speech and 64k mono is transparent quality for 16kHz content).
+    """
+    if not _FFMPEG_PATH:
+        return wav_path, False
+    opus_path = wav_path.with_suffix(".ogg")
+    try:
+        result = subprocess.run(
+            [
+                _FFMPEG_PATH, "-y",
+                "-i", str(wav_path),
+                "-c:a", "libopus",
+                "-b:a", "64k",      # 64kbps – transparent quality for 16kHz mono speech
+                "-ar", "16000",      # keep original sample rate
+                "-ac", "1",          # mono
+                "-application", "voip",  # optimized for speech
+                str(opus_path),
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and opus_path.exists() and opus_path.stat().st_size > 0:
+            LOGGER.info(
+                "opus_compress wav=%s opus=%s ratio=%.1fx",
+                wav_path.stat().st_size,
+                opus_path.stat().st_size,
+                wav_path.stat().st_size / opus_path.stat().st_size,
+            )
+            return opus_path, True
+        LOGGER.warning("opus_compress_failed rc=%s stderr=%s", result.returncode, result.stderr[:200])
+    except Exception as exc:
+        LOGGER.warning("opus_compress_error: %s", exc)
+    return wav_path, False
+
+
 def extract_whisper_server_text(response: requests.Response) -> str:
     content_type = response.headers.get("content-type", "").lower()
     if "application/json" in content_type:
@@ -1864,11 +1908,22 @@ class GroqTranscribeThread(QThread):
 
     def run(self) -> None:
         headers = {"Authorization": f"Bearer {self.api_key}"}
+        opus_path: Path | None = None
         try:
-            with open(self.wav_path, "rb") as f:
+            # Compress WAV → OGG Opus for faster upload (falls back to WAV)
+            upload_path, is_opus = wav_to_ogg_opus(self.wav_path)
+            if is_opus:
+                opus_path = upload_path
+                file_name = "recording.ogg"
+                mime_type = "audio/ogg"
+            else:
+                file_name = "recording.wav"
+                mime_type = "audio/wav"
+
+            with open(upload_path, "rb") as f:
                 response = requests.post(
                     self.GROQ_URL,
-                    files={"file": ("recording.wav", f, "audio/wav")},
+                    files={"file": (file_name, f, mime_type)},
                     data={"model": "whisper-large-v3", "language": "de"},
                     headers=headers,
                     timeout=60.0,
@@ -1876,7 +1931,7 @@ class GroqTranscribeThread(QThread):
             response.raise_for_status()
             data = response.json()
             transcript = data.get("text", "").strip()
-            LOGGER.info("groq_transcribe ok chars=%s", len(transcript))
+            LOGGER.info("groq_transcribe ok chars=%s opus=%s", len(transcript), is_opus)
             if not transcript:
                 self.failed.emit(self.session_id, "Groq API hat leere Transkription zurueckgegeben.")
                 return
@@ -1895,6 +1950,10 @@ class GroqTranscribeThread(QThread):
             self.failed.emit(self.session_id, f"Groq API Fehler ({status}): {body or exc}")
         except Exception as exc:
             self.failed.emit(self.session_id, f"Groq Fehler: {exc}")
+        finally:
+            # Clean up temporary opus file
+            if opus_path and opus_path.exists():
+                opus_path.unlink(missing_ok=True)
 
 
 class VoiceClipWidget(QWidget):

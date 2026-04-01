@@ -2062,6 +2062,7 @@ class VoiceClipWidget(QWidget):
         self.finalize_thread: FinalizeRecordingThread | None = None
         self.stream_finalize_thread: StreamFinalizeThread | None = None
         self.transcribe_thread: TranscribeThread | None = None
+        self._retiring_threads: list[QThread] = []
 
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(12, 12, 12, 12)
@@ -2975,6 +2976,34 @@ class VoiceClipWidget(QWidget):
         self.finalize_thread.failed.connect(self._on_transcript_failed)
         self.finalize_thread.start()
 
+    def _retire_transcribe_thread(self) -> None:
+        """Safely retire the current transcribe thread before replacing it.
+
+        A QThread must not be destroyed while still running (Qt will abort).
+        Disconnect signals, park the old thread in a holding list, and let
+        deleteLater clean it up once run() has returned.
+        """
+        old = self.transcribe_thread
+        self.transcribe_thread = None
+        if old is None:
+            return
+        try:
+            old.disconnect()
+        except TypeError:
+            pass  # no connections
+        if old.isRunning():
+            self._retiring_threads.append(old)
+            old.finished.connect(lambda t=old: self._cleanup_retired_thread(t))
+        else:
+            old.deleteLater()
+
+    def _cleanup_retired_thread(self, thread: QThread) -> None:
+        try:
+            self._retiring_threads.remove(thread)
+        except ValueError:
+            pass
+        thread.deleteLater()
+
     def _on_wav_ready(self, session_id: str, wav_path: str) -> None:
         if not self._is_session_active(session_id):
             Path(wav_path).unlink(missing_ok=True)
@@ -2986,6 +3015,7 @@ class VoiceClipWidget(QWidget):
         if self._groq_api_key:
             self.enter_processing_state()
             LOGGER.info("transcribe_groq session=%s", session_id)
+            self._retire_transcribe_thread()
             self.transcribe_thread = GroqTranscribeThread(
                 session_id, self.current_wav_path, self._groq_api_key
             )
@@ -2998,6 +3028,7 @@ class VoiceClipWidget(QWidget):
         if self._remote_server_url and self._remote_server_healthy:
             self.enter_processing_state()
             LOGGER.info("transcribe_remote url=%s session=%s", self._remote_server_url, session_id)
+            self._retire_transcribe_thread()
             self.transcribe_thread = RemoteTranscribeThread(
                 session_id, self.current_wav_path, self._remote_server_url, self._remote_api_key
             )
@@ -3013,6 +3044,7 @@ class VoiceClipWidget(QWidget):
             return
 
         self.enter_processing_state()
+        self._retire_transcribe_thread()
         self.transcribe_thread = TranscribeThread(session_id, self.hq_model_path, self.current_wav_path)
         self.transcribe_thread.finished_ok.connect(self._on_transcript_ready)
         self.transcribe_thread.failed.connect(self._on_transcript_failed)
@@ -3028,6 +3060,7 @@ class VoiceClipWidget(QWidget):
             return
 
         self.notify(APP_NAME, "Groq nicht erreichbar, nutze lokales Modell ...", QSystemTrayIcon.MessageIcon.Warning)
+        self._retire_transcribe_thread()
         self.transcribe_thread = TranscribeThread(session_id, self.hq_model_path, self.current_wav_path)
         self.transcribe_thread.finished_ok.connect(self._on_transcript_ready)
         self.transcribe_thread.failed.connect(self._on_transcript_failed)
@@ -3045,6 +3078,7 @@ class VoiceClipWidget(QWidget):
             return
 
         self.notify(APP_NAME, "Server nicht erreichbar, nutze lokales Modell ...", QSystemTrayIcon.MessageIcon.Warning)
+        self._retire_transcribe_thread()
         self.transcribe_thread = TranscribeThread(session_id, self.hq_model_path, self.current_wav_path)
         self.transcribe_thread.finished_ok.connect(self._on_transcript_ready)
         self.transcribe_thread.failed.connect(self._on_transcript_failed)

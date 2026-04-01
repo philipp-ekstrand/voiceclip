@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 import wave
+from collections.abc import Callable
 from io import BytesIO
 import json
 import logging
@@ -873,6 +874,145 @@ def install_macos_overlay_behavior(widget: QWidget) -> bool:
         return True
     except Exception:
         return False
+
+
+class CommandDoubleTapMonitor:
+    """Detects double-tap of the Command key globally (even when app is in background).
+
+    Uses NSEvent global + local monitors for flagsChanged and keyDown events.
+    Calls on_double_tap() callback when a clean double-tap is detected.
+
+    A "clean tap" means Command is pressed and released without any other key
+    being pressed while it was held, and the hold duration is short.
+    """
+
+    DOUBLE_TAP_WINDOW = 0.4
+    MAX_HOLD_DURATION = 0.3
+
+    def __init__(self, on_double_tap: Callable[[], None]) -> None:
+        self._on_double_tap = on_double_tap
+        self._global_flags_monitor: object | None = None
+        self._local_flags_monitor: object | None = None
+        self._global_keydown_monitor: object | None = None
+        self._local_keydown_monitor: object | None = None
+        self._command_is_down: bool = False
+        self._command_alone: bool = True
+        self._command_down_at: float = 0.0
+        self._last_tap_at: float = 0.0
+        self._enabled: bool = False
+
+    def start(self) -> bool:
+        if self._enabled:
+            return True
+        if sys.platform != "darwin":
+            LOGGER.warning("command_doubletap_monitor platform_not_supported")
+            return False
+        try:
+            from AppKit import NSEvent
+            from AppKit import NSEventMaskFlagsChanged, NSEventMaskKeyDown
+        except ImportError:
+            LOGGER.warning("command_doubletap_monitor appkit_import_failed")
+            return False
+        try:
+            self._global_flags_monitor = (
+                NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                    NSEventMaskFlagsChanged, self._handle_flags_changed
+                )
+            )
+            self._global_keydown_monitor = (
+                NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                    NSEventMaskKeyDown, self._handle_keydown
+                )
+            )
+            self._local_flags_monitor = (
+                NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                    NSEventMaskFlagsChanged, self._handle_flags_changed_local
+                )
+            )
+            self._local_keydown_monitor = (
+                NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                    NSEventMaskKeyDown, self._handle_keydown_local
+                )
+            )
+            self._enabled = True
+            LOGGER.info("command_doubletap_monitor started")
+            return True
+        except Exception as exc:
+            LOGGER.error("command_doubletap_monitor start_failed error=%s", exc)
+            self.stop()
+            return False
+
+    def stop(self) -> None:
+        if not self._enabled:
+            return
+        try:
+            from AppKit import NSEvent
+        except ImportError:
+            self._enabled = False
+            return
+        for attr in (
+            "_global_flags_monitor",
+            "_local_flags_monitor",
+            "_global_keydown_monitor",
+            "_local_keydown_monitor",
+        ):
+            monitor = getattr(self, attr, None)
+            if monitor is not None:
+                try:
+                    NSEvent.removeMonitor_(monitor)
+                except Exception as exc:
+                    LOGGER.warning("command_doubletap_monitor remove_failed attr=%s error=%s", attr, exc)
+                setattr(self, attr, None)
+        self._enabled = False
+        LOGGER.info("command_doubletap_monitor stopped")
+
+    def _handle_flags_changed(self, event) -> None:
+        try:
+            from AppKit import NSEventModifierFlagCommand
+            flags = event.modifierFlags()
+            command_now = bool(flags & NSEventModifierFlagCommand)
+            now = time.monotonic()
+
+            if command_now and not self._command_is_down:
+                self._command_is_down = True
+                self._command_alone = True
+                self._command_down_at = now
+            elif not command_now and self._command_is_down:
+                self._command_is_down = False
+                hold_duration = now - self._command_down_at
+                if self._command_alone and hold_duration < self.MAX_HOLD_DURATION:
+                    gap = now - self._last_tap_at
+                    if self._last_tap_at > 0 and gap < self.DOUBLE_TAP_WINDOW:
+                        self._last_tap_at = 0.0
+                        self._on_tap_detected()
+                    else:
+                        self._last_tap_at = now
+                else:
+                    self._last_tap_at = 0.0
+        except Exception as exc:
+            LOGGER.debug("command_doubletap_monitor flags_handler error=%s", exc)
+
+    def _handle_flags_changed_local(self, event):
+        self._handle_flags_changed(event)
+        return event
+
+    def _handle_keydown(self, event) -> None:
+        try:
+            if self._command_is_down:
+                self._command_alone = False
+        except Exception:
+            pass
+
+    def _handle_keydown_local(self, event):
+        self._handle_keydown(event)
+        return event
+
+    def _on_tap_detected(self) -> None:
+        LOGGER.info("command_doubletap_detected")
+        try:
+            QTimer.singleShot(0, self._on_double_tap)
+        except Exception as exc:
+            LOGGER.error("command_doubletap_dispatch_failed error=%s", exc)
 
 
 class SingleInstanceGuard:
@@ -3340,6 +3480,16 @@ class VoiceClipApp:
         self.autostart_action.triggered.connect(self.toggle_login_item)
         self.tray_menu.addAction(self.autostart_action)
 
+        self._hotkey_settings = QSettings()
+        self._hotkey_enabled = self._hotkey_settings.value(
+            "hotkey.command_doubletap_enabled", True, type=bool
+        )
+        self.hotkey_action = QAction("Doppeltipp \u2318-Shortcut", self.qt_app)
+        self.hotkey_action.setCheckable(True)
+        self.hotkey_action.setChecked(self._hotkey_enabled)
+        self.hotkey_action.triggered.connect(self.toggle_hotkey)
+        self.tray_menu.addAction(self.hotkey_action)
+
         self.tray_menu.addSeparator()
 
         self.quit_action = QAction("Quit", self.qt_app)
@@ -3349,6 +3499,22 @@ class VoiceClipApp:
         self.tray_icon.setToolTip(APP_NAME)
         self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
+
+        self._command_monitor = CommandDoubleTapMonitor(
+            on_double_tap=self._on_hotkey_double_tap
+        )
+        if self._hotkey_enabled:
+            if not self._command_monitor.start():
+                LOGGER.warning("command_doubletap_monitor failed_to_start, hotkey disabled")
+                self._hotkey_enabled = False
+                self.hotkey_action.setChecked(False)
+            elif not self._hotkey_settings.value("hotkey.permission_notice_shown", False, type=bool):
+                self.show_notification(
+                    APP_NAME,
+                    "Doppeltipp \u2318 aktiviert. Falls nicht funktioniert: "
+                    "Systemeinstellungen \u203a Datenschutz \u203a Eingabe\u00fcberwachung \u203a voiceClip erlauben."
+                )
+                self._hotkey_settings.setValue("hotkey.permission_notice_shown", True)
 
         self.window.hide()
         self.on_window_state_changed(self.window.state)
@@ -3534,11 +3700,47 @@ class VoiceClipApp:
             self.autostart_action.setChecked(login_item_enabled())
             self.show_notification(APP_NAME, f"Autostart konnte nicht gesetzt werden: {exc}", QSystemTrayIcon.MessageIcon.Warning)
 
+    def _on_hotkey_double_tap(self) -> None:
+        LOGGER.info("hotkey_action source=hotkey state=%s", self.window.state)
+        now = time.monotonic()
+        if now - self._last_tray_action_at < (self._tray_action_debounce_ms / 1000.0):
+            return
+        self._last_tray_action_at = now
+        if self.window.state in {STATE_BOOT, STATE_DOWNLOADING, STATE_STARTING,
+                                  STATE_STOPPING, STATE_PROCESSING, STATE_CHECK}:
+            return
+        self.window.dispatch_primary_action(source="hotkey")
+
+    def toggle_hotkey(self, enabled: bool) -> None:
+        if enabled:
+            success = self._command_monitor.start()
+            if success:
+                self._hotkey_enabled = True
+                self._hotkey_settings.setValue("hotkey.command_doubletap_enabled", True)
+                self.show_notification(APP_NAME, "\u2318-Shortcut aktiviert.")
+            else:
+                self.hotkey_action.setChecked(False)
+                self._hotkey_enabled = False
+                self.show_notification(
+                    APP_NAME,
+                    "\u2318-Shortcut konnte nicht aktiviert werden. Eingabe\u00fcberwachung erlauben.",
+                    QSystemTrayIcon.MessageIcon.Warning,
+                )
+        else:
+            self._command_monitor.stop()
+            self._hotkey_enabled = False
+            self._hotkey_settings.setValue("hotkey.command_doubletap_enabled", False)
+            self.show_notification(APP_NAME, "\u2318-Shortcut deaktiviert.")
+
     def show_notification(self, title: str, message: str, icon=QSystemTrayIcon.MessageIcon.Information) -> None:
         self.tray_icon.showMessage(title, message, icon, 3000)
 
     def quit(self) -> None:
         LOGGER.info("app_quit_requested pid=%s", os.getpid())
+        try:
+            self._command_monitor.stop()
+        except Exception:
+            pass
         try:
             self.window.shutdown()
         except Exception:
